@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blueprint-framework"
+version = "0.1.0"
+description = "Blueprint Framework (BPFW) - MVP catalog control framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+  {name = "Blueprint Framework Contributors"}
+]
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+bpfw = "bpfw.cli:main"
+
+[project.entry-points."bpfw.integrations"]
+inspect = "bpfw.integrations.inspect:InspectIntegration"
+editor = "bpfw.integrations.editor:EditorIntegration"
+repair = "bpfw.integrations.repair:ProtectionRepairIntegration"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
