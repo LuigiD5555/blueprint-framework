@@ -7,18 +7,12 @@ from bpfw.catalog.verify import run_verify
 from bpfw.catalog.writer import run_init
 from bpfw.core.pipeline import Pipeline, PipelineStep
 from bpfw.core.result import ResultStatus, StepResult
-from bpfw.integrations.registry import (
-    IntegrationRegistry,
-    build_default_integration_registry,
-)
 from bpfw.protection.authority import (
     MISSING_BLUEPRINT_STATUS,
     get_authority_lock_state,
     lock_authority,
     unlock_authority,
 )
-
-AUTHORITY_EDITING_PLUGINS = {"inspect", "editor"}
 
 
 @dataclass(slots=True)
@@ -34,39 +28,6 @@ class InitProjectStep(PipelineStep):
             message=message,
             source=self.name,
             details={"blueprint_path": CANONICAL_BLUEPRINT_FILE},
-        )
-
-
-@dataclass(slots=True)
-class PluginStep(PipelineStep):
-    """Run a named optional BPFW plugin."""
-
-    integration_registry: IntegrationRegistry
-    integration_name: str
-    name: str
-
-    def run(self, context) -> StepResult:  # noqa: ANN001
-        lock_state = get_authority_lock_state(project_root=context.project_root)
-        if self.integration_name in AUTHORITY_EDITING_PLUGINS and lock_state in {"locked", "degraded"}:
-            return StepResult(
-                status=ResultStatus.BLOCK,
-                message=(
-                    "BLOCK: Blueprint is locked. "
-                    "Run bpfw unlock before editing authority data."
-                ),
-                source=self.name,
-                details={"error_code": "AUTHORITY_LOCKED"},
-            )
-
-        result = self.integration_registry.run(
-            name=self.integration_name,
-            project_root=context.project_root,
-        )
-        return StepResult(
-            status=ResultStatus.OK if result.success else ResultStatus.BLOCK,
-            message=result.message,
-            source=self.name,
-            details={"integration": self.integration_name},
         )
 
 
@@ -195,12 +156,8 @@ class AuthorityStatusStep(PipelineStep):
         )
 
 
-def build_default_registry(
-    integration_registry: IntegrationRegistry | None = None,
-) -> dict[str, Pipeline]:
+def build_default_registry() -> dict[str, Pipeline]:
     """Build the exact MVP command registry."""
-
-    optional_integrations = integration_registry or build_default_integration_registry()
     pipelines = {
         "init": Pipeline(name="init", steps=[InitProjectStep()]),
         "verify": Pipeline(name="verify", steps=[VerifyBlueprintStep()]),
@@ -208,19 +165,5 @@ def build_default_registry(
         "unlock": Pipeline(name="unlock", steps=[AuthorityUnlockStep()]),
         "status": Pipeline(name="status", steps=[AuthorityStatusStep()]),
     }
-
-    for integration in optional_integrations.list_integrations():
-        if integration.name in pipelines:
-            continue
-        pipelines[integration.name] = Pipeline(
-            name=integration.name,
-            steps=[
-                PluginStep(
-                    integration_registry=optional_integrations,
-                    integration_name=integration.name,
-                    name=f"plugins.{integration.name}",
-                )
-            ],
-        )
 
     return pipelines

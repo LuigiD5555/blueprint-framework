@@ -21,13 +21,10 @@ from bpfw.reports.verify_report import render_verify_report
 
 MVP_COMMANDS = (
     "init",
-    "inspect",
-    "editor",
     "verify",
     "status",
     "lock",
     "unlock",
-    "repair",
 )
 
 
@@ -42,13 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Commands:\n"
             "  init       Initialize BPFW in the current project.\n"
-            "  inspect    Review detected code and declare responsibilities.\n"
-            "  editor     Navigate and edit the existing blueprint.\n"
             "  verify     Verify code and blueprint alignment.\n"
             "  status     Show project, blueprint, drift, and lock status.\n"
             "  lock       Lock blueprint authority.\n"
-            "  unlock     Unlock blueprint authority.\n"
-            "  repair     Repair local authority protection."
+            "  unlock     Unlock blueprint authority."
         ),
     )
     parser.add_argument(
@@ -163,10 +157,7 @@ def _print_human(payload: dict) -> None:
         print(f"  lifecycle: {details.get('lifecycle_state', 'unknown')}")
         return
 
-    if payload["command_name"] in {"inspect", "editor"} and not payload["message"]:
-        return
-
-    # lock, unlock, inspect, editor, repair: print message directly
+    # lock and unlock: print message directly
     if payload["message"]:
         print(payload["message"])
         return
