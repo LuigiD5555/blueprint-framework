@@ -3,7 +3,6 @@
 from bpfw.protection.authority import (
     ProtectedResource,
     ProtectionResult,
-    get_authority_lock_state,
     get_authority_protection_status,
     lock_authority,
     resolve_bpfw_package_root,
@@ -12,12 +11,14 @@ from bpfw.protection.authority import (
     resolve_protected_resources,
     unlock_authority,
 )
+from bpfw.protection.capabilities import LockSupportResult, check_lock_support
 from bpfw.protection.setup import run_protection_setup
 
 __all__ = [
+    "LockSupportResult",
     "ProtectedResource",
     "ProtectionResult",
-    "get_authority_lock_state",
+    "check_lock_support",
     "get_authority_protection_status",
     "lock_authority",
     "resolve_bpfw_package_root",
