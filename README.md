@@ -1,53 +1,39 @@
 # Blueprint Framework (BPFW)
 
-Blueprint Framework (BPFW) is an MVP catalog control tool for Python projects.
+Blueprint Framework (BPFW) Core is a local structural guard for Python projects.
+It creates blueprint authority files, checks them against real code, protects the authority files, watches for drift during AI-assisted work, and can rebuild shard layout when needed.
 
-This repository contains only the framework code (no application/domain code from the original project).
+## What BPFW Core provides
 
-## What it provides
+- `bpfw/blueprint.yaml` authority generation.
+- Sharded authority files under `bpfw/blocks/`.
+- Verification against discovered Python code.
+- Drift reports for undeclared, missing, invalid, duplicate, or unsafe authority data.
+- OS-level authority lock and unlock commands.
+- Semi-real-time watch feedback for code and authority changes.
+- Automatic safe shard synchronization before `bpfw verify` and `bpfw status`.
+- Manual shard synchronization through `bpfw reshard` for recovery or explicit maintenance.
 
-- `bpfw/blueprint.yaml` catalog generation
-- Catalog validation against discovered Python code
-- Drift detection for declared responsibilities
-- Protected initialization with OS-level authority lock
-- Repair flow for incomplete local protection
-- Human-readable `verify` and `status` reports
+## What is not included in Core
 
-## Install (editable)
+BPFW Core does not ship interactive completion tools, planning tools, or external tool orchestration. The public surface is intentionally limited to authority, verification, locking, watching, and shard maintenance.
 
-```bash
-python -m pip install -e .
-```
-
-Verify the installed command resolves from the same environment:
-
-```bash
-which -a bpfw
-python -m bpfw --help
-```
-
-If `bpfw` points to an older environment, clear the shell command cache and
-check again:
+## Install editable
 
 ```bash
-hash -r
-which -a bpfw
+pip install -e .
 ```
-
-`python -m bpfw ...` is the environment-safe invocation because it uses the
-same Python interpreter that installed the package.
 
 ## CLI
 
 ```bash
 bpfw init
-bpfw inspect
-bpfw editor
 bpfw verify
 bpfw status
 bpfw lock
 bpfw unlock
-bpfw repair
+bpfw watch
+bpfw reshard
 ```
 
 ## Project root resolution
@@ -58,28 +44,29 @@ When running BPFW against another project, point it to that project root:
 bpfw verify --project-root /path/to/target-project
 ```
 
-The target project may contain `bpfw/blueprint.yaml`. If it does not, run `bpfw init`.
-
-## Authority Lock
-
-`bpfw init` creates the blueprint and enables OS-level authority protection.
-`bpfw lock` protects exactly:
-
-```text
-bpfw/blueprint.yaml
-BPFW internal guard files
-```
-
-If an existing project has a broken lock state, run:
+The target project may contain `bpfw/blueprint.yaml`. If it does not, run:
 
 ```bash
-bpfw repair
+bpfw init --project-root /path/to/target-project
 ```
 
-`bpfw unlock` reverses the same protection for intentional authority edit
-windows. There is no separate public protection setup flow.
+## Authority workflow
+
+1. Run `bpfw init` to create `bpfw/blueprint.yaml` and initial shard files.
+2. Fill or adjust authority fields in the blueprint shards.
+3. Run `bpfw verify` to check declared authority against real code.
+4. Run `bpfw lock` to protect authority files.
+5. Run `bpfw watch` while using Codex, Claude, Cline, or similar coding tools.
+6. Run `bpfw unlock` before intentional authority edits.
+7. Use `bpfw reshard` only when automatic synchronization cannot safely fix shard layout.
 
 ## Notes
 
 - Internal Python package path is `bpfw`.
 - Distribution/package name is `blueprint-framework` and CLI command is `bpfw`.
+
+## Shard synchronization
+
+`bpfw verify` and `bpfw status` perform a non-interactive safe synchronization pass before reading authority data. This keeps shard placement aligned with the current blueprint data during normal work.
+
+`bpfw reshard` remains available as an explicit recovery command for locked files, interrupted writes, large migrations, or cases where automatic synchronization is intentionally skipped.

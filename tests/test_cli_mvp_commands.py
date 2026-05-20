@@ -2,12 +2,12 @@ import pytest
 from pathlib import Path
 import sys
 
+from bpfw.authority.reshard import migrate_root_blocks_to_default_shard
 from bpfw.catalog.access_control import authorize_blueprint_writes_for_tool, authorize_temporary_blueprint_unlock_for_tool
 from bpfw.cli import (
     MVP_COMMANDS,
     main,
     resolve_cli_command,
-    _migrate_root_blocks_to_default_shard,
     _attempt_permission_fix,
 )
 
@@ -87,7 +87,7 @@ def test_main_help_hides_internal_options() -> None:
     assert "bpfw verify --all" in rendered_help
 
 
-def test_migrate_root_blocks_to_default_shard_moves_legacy_blocks(tmp_path: Path) -> None:
+def testmigrate_root_blocks_to_default_shard_moves_legacy_blocks(tmp_path: Path) -> None:
     import yaml
 
     (tmp_path / "bpfw" / "blocks").mkdir(parents=True)
@@ -108,7 +108,7 @@ def test_migrate_root_blocks_to_default_shard_moves_legacy_blocks(tmp_path: Path
 
     with authorize_blueprint_writes_for_tool("reshard"):
         with authorize_temporary_blueprint_unlock_for_tool("reshard"):
-            summary = _migrate_root_blocks_to_default_shard(project_root=tmp_path)
+            summary = migrate_root_blocks_to_default_shard(project_root=tmp_path)
     migrated_blueprint = yaml.safe_load(blueprint_path.read_text(encoding="utf-8"))
     migrated_core = yaml.safe_load(core_shard_path.read_text(encoding="utf-8"))
 
@@ -140,7 +140,7 @@ def test_attempt_permission_fix_executes_sudo_sequence(monkeypatch: pytest.Monke
     assert calls[2][0:2] == ["sudo", "chmod"]
 
 
-def test_migrate_root_blocks_to_default_shard_skips_duplicate_code_declarations(tmp_path: Path) -> None:
+def testmigrate_root_blocks_to_default_shard_skips_duplicate_code_declarations(tmp_path: Path) -> None:
     import yaml
 
     (tmp_path / "bpfw" / "blocks").mkdir(parents=True)
@@ -181,7 +181,7 @@ def test_migrate_root_blocks_to_default_shard_skips_duplicate_code_declarations(
 
     with authorize_blueprint_writes_for_tool("reshard"):
         with authorize_temporary_blueprint_unlock_for_tool("reshard"):
-            summary = _migrate_root_blocks_to_default_shard(project_root=tmp_path)
+            summary = migrate_root_blocks_to_default_shard(project_root=tmp_path)
     migrated_core = yaml.safe_load(core_shard_path.read_text(encoding="utf-8"))
 
     assert summary["migrated"] == 0
