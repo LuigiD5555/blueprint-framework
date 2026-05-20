@@ -131,7 +131,7 @@ def contains_secret_keyword(value: str) -> bool:
     """Return whether a string contains a secret-like keyword.
 
     Args:
-        value: String to inspect.
+        value: String to review.
 
     Returns:
         True when the value contains a suspicious keyword. False otherwise.
@@ -150,7 +150,7 @@ def looks_like_absolute_path(value: str) -> bool:
     """Return whether a value looks like an absolute filesystem path.
 
     Args:
-        value: String value to inspect.
+        value: String value to review.
 
     Returns:
         True when the value looks like a POSIX or Windows absolute path.

@@ -3,13 +3,6 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from bpfw.catalog.lifecycle import (
-    ALLOWED_LIFECYCLES,
-    LIFECYCLE_ACTIVE,
-    LIFECYCLE_DEPRECATED,
-    LIFECYCLE_EXPERIMENTAL,
-    LIFECYCLE_LEGACY,
-)
 from bpfw.reports.finding import Finding
 
 # Authority state constants
@@ -18,6 +11,7 @@ AUTHORITY_STATE_EMPTY = "empty"
 AUTHORITY_STATE_DRAFT = "draft"
 AUTHORITY_STATE_DEFINED = "defined"
 AUTHORITY_STATE_INVALID = "invalid"
+
 
 @dataclass(frozen=True)
 class DiscoveredCodeUnit:
@@ -36,6 +30,8 @@ class DiscoveredCodeUnit:
     decorators: List[str] = field(default_factory=list)
     docstring: Optional[str] = None
     signature: Optional[str] = None
+    calls: List[Dict[str, Any]] = field(default_factory=list)
+    """Structured call references extracted from AST. Each dict has 'context' and 'name' keys."""
 
 
 @dataclass(frozen=True)
@@ -67,6 +63,6 @@ class VerificationReport:
     discovered_count: int = 0
     missing_declared_count: int = 0
     undeclared_count: int = 0
-    duplicate_active_intent_count: int = 0
+    duplicate_active_purpose_count: int = 0
     invalid_lifecycle_count: int = 0
     incomplete_responsibility_count: int = 0

@@ -18,17 +18,17 @@ def test_validate_no_blueprint_secrets_allows_clean_blueprint() -> None:
                 "detected_detail_level": "minimal",
             }
         },
-        "responsibilities": [
+        "blocks": [
             {
                 "id": "user_service",
-                "intent": "manage_users",
-                "canonical_name": "User Service",
+                "purpose": "manage_users",
+                "name": "User Service",
                 "domain": "users",
-                "lifecycle": "active",
-                "location": {
+                "status": "active",
+                "code": {
                     "path": "src/users.py",
                     "symbol": "UserService",
-                    "symbol_type": "class",
+                    "kind": "class",
                 },
                 "detected": {
                     "qualified_name": "users.UserService",
@@ -48,10 +48,10 @@ def test_validate_no_blueprint_secrets_blocks_secret_like_field() -> None:
 
     blueprint_data = {
         "version": 1,
-        "responsibilities": [
+        "blocks": [
             {
                 "id": "auth_service",
-                "intent": "authenticate_users",
+                "purpose": "authenticate_users",
                 "api_key": "abc123",
             }
         ],
@@ -68,10 +68,10 @@ def test_validate_no_blueprint_secrets_blocks_secret_like_value() -> None:
 
     blueprint_data = {
         "version": 1,
-        "responsibilities": [
+        "blocks": [
             {
                 "id": "auth_service",
-                "intent": "authenticate_users",
+                "purpose": "authenticate_users",
                 "notes": "Reads bearer token from request headers.",
             }
         ],

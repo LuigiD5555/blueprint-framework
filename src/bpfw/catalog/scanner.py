@@ -2,9 +2,10 @@
 
 import ast
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from bpfw.catalog.models import DiscoveredCodeUnit, ScanResult
+from bpfw.catalog.review_order import order_blocks_for_review
 from bpfw.reports.finding import Finding
 
 
@@ -54,24 +55,14 @@ def scan_python_project(
             discovered_units.extend(file_units)
             findings.extend(file_findings)
 
-    # Sort discovered units so inspect reviews children before parent snippets.
-    discovered_units.sort(
-        key=_discovered_unit_sort_key
-    )
+    # Sort discovered units using dependency-first topological ordering.
+    # Dependencies are reviewed before dependents for better context.
+    discovered_units = order_blocks_for_review(discovered_units)
 
     return ScanResult(
         discovered_units=discovered_units,
         findings=findings,
     )
-
-
-def _discovered_unit_sort_key(unit: DiscoveredCodeUnit) -> tuple[str, int, int, int, str]:
-    """Return a stable child-before-parent order for inspect traversal."""
-
-    end_line = unit.end_line or unit.start_line or 0
-    start_line = unit.start_line or 0
-    nesting_depth = unit.symbol.count(".")
-    return unit.path, end_line, -nesting_depth, start_line, unit.symbol
 
 
 def _is_path_ignored(file_path: Path, ignored_paths: List[str]) -> bool:
@@ -182,6 +173,12 @@ def _extract_code_units(
         if isinstance(node, ast.ClassDef):
             if node.name.startswith("_"):
                 continue
+            # Filter out data classes (classes with no instance methods)
+            if _is_data_class(node):
+                continue
+            # Filter out protocols and abstract classes
+            if _is_protocol_or_abstract_class(node):
+                continue
 
             symbol_parts = parent_symbols + [node.name]
             unit = _extract_class_unit(
@@ -207,13 +204,24 @@ def _extract_code_units(
             continue
 
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Filter out private methods (except dunder methods)
             if node.name.startswith("_") and not (
                 node.name.startswith("__") and node.name.endswith("__")
             ):
                 continue
+            # Filter out nested functions in decorators
+            if _is_decorator_nested_function(node, parent_kind, parent_symbols):
+                continue
+            # Filter out tiny nested functions (< 5 lines of code)
+            if parent_kind == "function" and _is_tiny_nested_function(node):
+                continue
+            # Filter out trivial methods (getters/setters with minimal logic)
+            if parent_kind == "class" and _is_trivial_method(node):
+                continue
+            # Filter out property-like methods in schema.py
 
             symbol_parts = parent_symbols + [node.name]
-            if _should_discover_function(node=node, parent_kind=parent_kind):
+            if _should_discover_function(node=node, parent_kind=parent_kind, module=module):
                 unit = _extract_function_unit(
                     node=node,
                     file_path=file_path,
@@ -241,6 +249,56 @@ def _extract_code_units(
     return discovered_units
 
 
+def _is_trivial_method(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """
+    Check if a method is trivial (getter/setter with minimal logic).
+    A method is considered trivial if:
+    - It has less than 3 lines of actual code (excluding decorators and docstring)
+    - It doesn't contain complex logic (loops, conditions, try/except)
+    Args:
+        node: AST FunctionDef or AsyncFunctionDef node.
+        Returns:
+        True if the method is trivial, False otherwise.
+    """
+    # Count actual code lines (excluding decorators and docstring)
+    code_lines = 0
+    for stmt in node.body:
+        # Skip docstring if it's the first statement
+        if code_lines == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            if isinstance(stmt.value.value, str):
+                continue
+
+        code_lines += 1
+
+        # Check for complex structures
+        if isinstance(stmt, (ast.For, ast.While, ast.If, ast.Try, ast.With)):
+            return False  # Has complex control flow
+    # Consider trivial if no actual code lines (only docstring)
+    return code_lines < 1
+
+
+def _is_tiny_nested_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """
+    Check if a nested function is too small to be a separate block.
+
+    A nested function is considered tiny if it has less than 1 line of code.
+    Args:
+        node: AST FunctionDef or AsyncFunctionDef node.
+        Returns:
+        True if the nested function is tiny, False otherwise.
+    """
+    # Count total lines in body
+    total_lines = 0
+    for stmt in node.body:
+        # Skip docstring if it's the first statement
+        if total_lines == 0 and isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+            if isinstance(stmt.value.value, str):
+                continue
+        total_lines += 1
+    # Consider tiny if empty (no actual code, only docstring)
+    return total_lines < 1
+
+
 def _class_symbol_type(parent_symbols: List[str]) -> str:
     """Return the catalog symbol type for a class node."""
 
@@ -262,10 +320,23 @@ def _function_symbol_type(parent_symbols: List[str], parent_kind: str | None) ->
 def _should_discover_function(
     node: ast.FunctionDef | ast.AsyncFunctionDef,
     parent_kind: str | None,
+    module: str,
 ) -> bool:
-    """Return whether a function-like node should become a snippet."""
-
+    """
+    Return whether a function-like node should become a block.
+    Filters out:
+    - All dunder methods in classes (__init__, __str__, etc.)
+    - Trivial getters/setters (less than 3 lines of actual code)
+    - Very small nested functions (less than 5 lines)
+    """
+    # Exclude all dunder methods in classes
     if parent_kind == "class" and node.name.startswith("__") and node.name.endswith("__"):
+        return False
+    # Exclude trivial getters/setters in classes (less than 3 lines of actual code)
+    if parent_kind == "class" and _is_trivial_method(node):
+        return False
+    # Exclude very small nested functions (less than 5 lines)
+    if parent_kind == "function" and _is_tiny_nested_function(node):
         return False
     return True
 
@@ -345,13 +416,15 @@ def _extract_class_unit(
     Returns:
         DiscoveredCodeUnit or None.
     """
-    methods = _extract_direct_child_function_symbols(
+    methods = _extract_direct_child_function_qualified_names(
         nodes=node.body,
+        module=module,
         parent_symbol=symbol,
         skip_dunder=True,
     )
-    functions = _extract_direct_child_class_symbols(
+    functions = _extract_direct_child_class_qualified_names(
         nodes=node.body,
+        module=module,
         parent_symbol=symbol,
     )
 
@@ -360,6 +433,9 @@ def _extract_class_unit(
 
     # Extract docstring
     docstring = ast.get_docstring(node)
+
+    # Extract structured calls from this class
+    calls = _extract_structured_calls_from_node(node)
 
     return DiscoveredCodeUnit(
         path=file_path,
@@ -374,7 +450,7 @@ def _extract_class_unit(
         imports=imports,
         decorators=decorators,
         docstring=docstring,
-        signature=None,
+        signature=None,        calls=calls,
     )
 
 
@@ -406,10 +482,13 @@ def _extract_function_unit(
 
     # Extract signature
     signature = _extract_function_signature(node)
-    functions = _extract_direct_child_symbols(
+    functions = _extract_direct_child_qualified_names(
         nodes=node.body,
+        module=module,
         parent_symbol=symbol,
     )
+    # Extract structured calls from this function
+    calls = _extract_structured_calls_from_node(node)
 
     return DiscoveredCodeUnit(
         path=file_path,
@@ -424,12 +503,12 @@ def _extract_function_unit(
         imports=imports,
         decorators=decorators,
         docstring=docstring,
-        signature=signature,
+        signature=signature,        calls=calls,
     )
 
 
 def _extract_direct_child_symbols(nodes: List[ast.stmt], parent_symbol: str) -> List[str]:
-    """Return direct nested snippet symbols for a code unit."""
+    """Return direct nested block symbols for a code unit."""
 
     child_symbols: List[str] = []
     child_symbols.extend(
@@ -446,6 +525,70 @@ def _extract_direct_child_symbols(nodes: List[ast.stmt], parent_symbol: str) -> 
         )
     )
     return child_symbols
+
+
+def _extract_direct_child_qualified_names(
+    nodes: List[ast.stmt],
+    module: str,
+    parent_symbol: str,
+) -> List[str]:
+    """Return direct nested block qualified names for a code unit."""
+
+    child_qualified: List[str] = []
+    child_qualified.extend(
+        _extract_direct_child_function_qualified_names(
+            nodes=nodes,
+            module=module,
+            parent_symbol=parent_symbol,
+            skip_dunder=False,
+        )
+    )
+    child_qualified.extend(
+        _extract_direct_child_class_qualified_names(
+            nodes=nodes,
+            module=module,
+            parent_symbol=parent_symbol,
+        )
+    )
+    return child_qualified
+
+
+def _extract_direct_child_function_qualified_names(
+    nodes: List[ast.stmt],
+    module: str,
+    parent_symbol: str,
+    skip_dunder: bool,
+) -> List[str]:
+    """Return direct nested function-like qualified names for a code unit."""
+
+    child_qualified: List[str] = []
+    for node in nodes:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name.startswith("_") and not (
+            node.name.startswith("__") and node.name.endswith("__")
+        ):
+            continue
+        if skip_dunder and node.name.startswith("__") and node.name.endswith("__"):
+            continue
+        child_symbol = f"{parent_symbol}.{node.name}"
+        child_qualified.append(f"{module}.{child_symbol}")
+    return child_qualified
+
+
+def _extract_direct_child_class_qualified_names(
+    nodes: List[ast.stmt],
+    module: str,
+    parent_symbol: str,
+) -> List[str]:
+    """Return direct nested class qualified names for a code unit."""
+
+    child_qualified: List[str] = []
+    for node in nodes:
+        if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+            child_symbol = f"{parent_symbol}.{node.name}"
+            child_qualified.append(f"{module}.{child_symbol}")
+    return child_qualified
 
 
 def _extract_direct_child_function_symbols(
@@ -540,6 +683,106 @@ def _get_attribute_name(node: ast.Attribute) -> str:
         parts.append(current.id)
 
     return ".".join(reversed(parts))
+
+
+def _extract_structured_calls_from_node(
+    node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+) -> List[Dict[str, Any]]:
+    """Extract structured call references from an AST node.
+    
+    Returns a list of dicts, each with 'context' and 'name' keys.
+    
+    Examples:
+        - self.get_origin() → {"context": "self", "name": "get_origin"}
+        - shard.get_blocks() → {"context": "shard", "name": "get_blocks"}
+        - helper() → {"context": None, "name": "helper"}
+        - Service() → {"context": None, "name": "Service"}
+        - self.index.get_authority_config() → {"context": None, "name": "get_authority_config"} (chained, not resolved)
+    
+    Args:
+        node: AST ClassDef, FunctionDef, or AsyncFunctionDef node.
+        
+    Returns:
+        List of structured call dicts.
+    """
+    calls: List[Dict[str, Any]] = []
+    
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        
+        call_info = _analyze_call(child.func)
+        if call_info:
+            calls.append(call_info)
+    
+    # Remove duplicates while preserving order
+    unique_calls: List[Dict[str, Any]] = []
+    seen = set()
+    for call in calls:
+        key = (call.get("context"), call.get("name"))
+        if key not in seen:
+            seen.add(key)
+            unique_calls.append(call)
+    
+    return unique_calls
+
+
+def _analyze_call(func_node: ast.expr) -> Dict[str, Any] | None:
+    """Analyze a call function node to extract context and name.
+    
+    Args:
+        func_node: The AST expression representing the function being called.
+        
+    Returns:
+        Dict with 'context' and 'name' keys, or None if not a local call.
+    """
+    # Case 1: self.method_name() or cls.method_name()
+    if isinstance(func_node, ast.Attribute):
+        # Check if the object being accessed is 'self' or 'cls'
+        if isinstance(func_node.value, ast.Name):
+            if func_node.value.id in ("self", "cls"):
+                return {"context": func_node.value.id, "name": func_node.attr}
+        # Otherwise it's shard.get_blocks(), self.index.get_config(), etc.
+        # These require runtime type info, so we only capture the tail name
+        # but context will indicate it's not self/cls
+        return {"context": _extract_context_prefix(func_node.value), "name": func_node.attr}
+    
+    # Case 2: bare_name() - could be function or class constructor
+    if isinstance(func_node, ast.Name):
+        return {"context": None, "name": func_node.id}
+    
+    # Case 3: Other complex expressions - ignore for dependency resolution
+    return None
+
+
+def _extract_context_prefix(node: ast.expr) -> str | None:
+    """Extract context prefix from an attribute chain.
+    
+    Examples:
+        - self.index.get_config → "self.index"
+        - shard.get_blocks → "shard"
+        - obj.prop.method → "obj.prop"
+    
+    Args:
+        node: AST expression node.
+        
+    Returns:
+        Context prefix as string, or None.
+    """
+    if isinstance(node, ast.Name):
+        return node.id
+    
+    if isinstance(node, ast.Attribute):
+        parts = [node.attr]
+        current = node.value
+        while isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        if isinstance(current, ast.Name):
+            parts.append(current.id)
+        return ".".join(reversed(parts))
+    
+    return None
 
 
 def _extract_function_signature(
@@ -646,3 +889,177 @@ def _extract_return_annotation(
             return str(node.returns)
     except (AttributeError, ValueError, TypeError):
         return None
+
+
+def _extract_parameter_annotation(arg: ast.arg) -> Optional[str]:
+    """
+    Extract type annotation from a parameter as string.
+
+    Args:
+        arg: AST arg node.
+
+    Returns:
+        Type annotation string or None.
+    """
+    if arg.annotation is None:
+        return None
+
+    try:
+        if hasattr(ast, "unparse"):
+            return ast.unparse(arg.annotation)
+        else:
+            return str(arg.annotation)
+    except (AttributeError, ValueError, TypeError):
+        return None
+
+
+def _get_default_value(node: ast.FunctionDef | ast.AsyncFunctionDef, arg_name: str) -> Any:
+    """
+    Get the default value for a parameter as a Python literal.
+
+    Args:
+        node: AST FunctionDef or AsyncFunctionDef node.
+        arg_name: Parameter name to find.
+
+    Returns:
+        Default value (can be any Python literal), or None if no default.
+    """
+    # Get defaults from args
+    # args.args are positional or keyword arguments
+    # defaults list aligns with the rightmost args
+    defaults = node.args.defaults
+    kw_defaults = node.args.kw_defaults
+    posonlyargs = node.args.posonlyargs
+    args_list = node.args.args
+    kwonlyargs = node.args.kwonlyargs
+
+    # Find which argument list contains our parameter
+    default_index = None
+
+    # Check positional-only args
+    for i, arg in enumerate(posonlyargs):
+        if arg.arg == arg_name:
+            # Positional-only defaults are in the defaults list
+            # They're aligned with the rightmost positional args
+            num_posonly = len(posonlyargs)
+            num_posorkw = len(args_list)
+            total_positional = num_posonly + num_posorkw
+            if len(defaults) > num_posorkw:
+                # Defaults apply to positional-only as well
+                idx = i - (total_positional - len(defaults))
+                if 0 <= idx < len(defaults):
+                    default_node = defaults[idx]
+                    return _ast_to_literal(default_node) if default_node is not None else None
+            return None
+
+    # Check positional or keyword args
+    for i, arg in enumerate(args_list):
+        if arg.arg == arg_name:
+            # Default index is relative to defaults list
+            # defaults align with rightmost args
+            num_args = len(args_list)
+            if i >= num_args - len(defaults):
+                default_index = i - (num_args - len(defaults))
+                if 0 <= default_index < len(defaults):
+                    default_node = defaults[default_index]
+                    return _ast_to_literal(default_node) if default_node is not None else None
+            return None
+
+    # Check keyword-only args
+    for i, arg in enumerate(kwonlyargs):
+        if arg.arg == arg_name:
+            if i < len(kw_defaults) and kw_defaults[i] is not None:
+                default_node = kw_defaults[i]
+                return _ast_to_literal(default_node) if default_node is not None else None
+            return None
+
+    # Check *args and **kwargs - they have no defaults
+    return None
+
+
+def _ast_to_literal(node: ast.AST) -> Any:
+    """
+    Convert an AST literal node to its Python value.
+
+    Args:
+        node: AST node representing a literal.
+
+    Returns:
+        Python value (None, bool, int, float, str) or the node string if not a simple literal.
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        # For simple names like None, True, False
+        if node.id in ("None", "True", "False"):
+            return {"None": None, "True": True, "False": False}[node.id]
+    # For more complex expressions, return as string
+    try:
+        if hasattr(ast, "unparse"):
+            return ast.unparse(node)
+    except (AttributeError, ValueError, TypeError):
+        pass
+    return None
+
+def _is_data_class(node: ast.ClassDef) -> bool:
+    """Return True when a class has no non-constructor instance methods."""
+
+    instance_methods = 0
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if statement.name in ("__init__", "__init_subclass__"):
+                continue
+            has_static_decorator = any(
+                isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
+                for decorator in statement.decorator_list
+            )
+            has_class_decorator = any(
+                isinstance(decorator, ast.Name) and decorator.id == "classmethod"
+                for decorator in statement.decorator_list
+            )
+            if not has_static_decorator and not has_class_decorator:
+                instance_methods += 1
+    return instance_methods == 0
+
+
+def _is_protocol_or_abstract_class(node: ast.ClassDef) -> bool:
+    """Return True when a class represents an abstract declaration."""
+
+    for decorator in node.decorator_list:
+        if isinstance(decorator, ast.Name) and decorator.id == "protocol":
+            return True
+        if isinstance(decorator, ast.Attribute) and decorator.attr == "Protocol":
+            return True
+    for base in node.bases:
+        if isinstance(base, ast.Name) and base.id in {"ABC", "ABCMeta", "Protocol"}:
+            return True
+        if isinstance(base, ast.Attribute):
+            attribute_name = _get_attribute_name(base)
+            if any(name in attribute_name for name in ("ABC", "Protocol")):
+                return True
+    return False
+
+
+def _is_decorator_nested_function(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    parent_kind: str | None,
+    parent_symbols: List[str],
+) -> bool:
+    """
+    Check if this is a nested function inside a decorator factory.
+    Args:
+        node: AST FunctionDef or AsyncFunctionDef node.
+        parent_kind: Kind of parent node.
+        parent_symbols: List of parent symbol names.
+        Returns:
+        True if it's a decorator nested function, False otherwise.
+    """
+    if parent_kind != "function":
+        return False
+    # Check if parent function name suggests it's a decorator factory
+    if parent_symbols:
+        parent_name = parent_symbols[-1]
+        return "decorator" in parent_name.lower()
+    return False

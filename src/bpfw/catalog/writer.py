@@ -1,36 +1,75 @@
 """Blueprint writer for BPFW MVP Catalog Mode initial blueprint generation."""
 
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, Dict, List
 
-from bpfw.catalog.access_control import ensure_blueprint_can_be_written
-from bpfw.catalog.lifecycle import ALLOWED_LIFECYCLES
+from bpfw.catalog.access_control import (
+    ensure_blueprint_can_be_written,
+    has_temporary_blueprint_unlock_authorization,
+)
+from bpfw.catalog.paths import (
+    DEFAULT_CORE_SHARD,
+    resolve_blueprint_path,
+    resolve_shard_path,
+)
+from bpfw.catalog.status import ALLOWED_STATUSES
 from bpfw.catalog.models import DiscoveredCodeUnit
-from bpfw.catalog.paths import resolve_blueprint_path
+from bpfw.catalog.symbol_types import normalize_symbol_type
+from bpfw.errors import BlueprintLockedError
 from bpfw.protection.setup import format_init_setup_summary, run_protection_setup
+from bpfw.protection.authority import (
+    get_authority_protection_status,
+    lock_authority,
+    unlock_authority,
+)
+from bpfw.shared.text import to_snake_case
 
 
-def to_snake_case(value: str) -> str:
-    """Convert a string to snake_case.
-    
-    Args:
-        value: The string to convert.
-    
-    Returns:
-        The string converted to snake_case.
+class BlockFactory:
+    """Centralized factory for creating blueprint block dictionaries.
+
+    Ensures every block has a consistent schema with all required keys,
+    avoiding scattered dict-literal construction across the codebase.
     """
-    result = []
-    for character in value:
-        if character.isupper():
-            if result and result[-1] != "_":
-                result.append("_")
-            result.append(character.lower())
-        elif character in (" ", "-", "."):
-            if result and result[-1] != "_":
-                result.append("_")
-        else:
-            result.append(character)
-    return "".join(result).strip("_")
+
+    @staticmethod
+    def create(
+        block_id: str,
+        name: str,
+        code: Dict[str, Any],
+        detected: Dict[str, Any],
+        *,
+        purpose: Any = None,
+        domain: Any = None,
+        status: Any = None,
+    ) -> Dict[str, Any]:
+        """Create a fully populated block dictionary.
+
+        Args:
+            block_id: Unique block identifier.
+            name: Human-readable block name.
+            code: Code metadata dict (path, module, symbol, kind, start_line, end_line).
+            detected: Detection metadata dict (qualified_name, kind, methods, functions).
+            purpose: Block purpose.
+            domain: Block domain.
+            status: Block lifecycle status.
+
+        Returns:
+            Complete block dictionary with all canonical keys.
+        """
+        block: Dict[str, Any] = {
+            "id": block_id,
+            "purpose": purpose,
+            "name": name,
+            "domain": domain,
+            "status": status,
+            "code": code,
+            "detected": detected,
+        }
+
+        return block
 
 
 def build_initial_blueprint(
@@ -43,54 +82,16 @@ def build_initial_blueprint(
     
     Args:
         project_root: Root directory of the project.
+        allow_unprotected: Whether init may succeed without OS authority protection.
         source_roots: List of source root directories.
         ignored_paths: List of ignored path patterns.
         discovered_units: List of discovered code units.
     
     Returns:
-        Dictionary containing blueprint data.
+        Dictionary containing blueprint index data (without blocks).
     """
     project_directory_name = project_root.name
     project_id = to_snake_case(project_directory_name)
-    
-    responsibilities = []
-    for unit in discovered_units:
-        responsibility = {
-            "id": to_snake_case(unit.symbol),
-            "intent": None,
-            "canonical_name": unit.symbol,
-            "domain": None,
-            "lifecycle": None,
-            "location": {
-                "path": unit.path,
-                "module": unit.module,
-                "symbol": unit.symbol,
-                "symbol_type": unit.symbol_type,
-                "start_line": unit.start_line,
-                "end_line": unit.end_line,
-            },
-            "detected": {
-                "qualified_name": unit.qualified_name,
-                "kind": unit.symbol_type,
-                "methods": unit.methods,
-                "functions": unit.functions,
-            },
-            "entrypoints": [],
-            "related_code": [],
-            "duplicate_policy": {
-                "group": None,
-                "allow_multiple_non_active": True,
-                "forbidden_active_duplicates": True,
-                "suspected_duplicates": [],
-            },
-            "replacement": {
-                "replaces": None,
-                "replaced_by": None,
-                "reason": None,
-            },
-            "notes": None,
-        }
-        responsibilities.append(responsibility)
     
     blueprint_data = {
         "version": 1,
@@ -106,8 +107,8 @@ def build_initial_blueprint(
             "mode": "catalog",
             "empty_blueprint_allows_execution": True,
             "defined_blueprint_blocks_on_drift": True,
-            "allowed_lifecycles": list(ALLOWED_LIFECYCLES),
-            "single_active_per_intent": True,
+            "allowed_statuses": list(ALLOWED_STATUSES),
+            "one_active_block_per_purpose": True,
             "undeclared_code_blocks": True,
             "missing_declared_code_blocks": True,
             "security": {
@@ -116,18 +117,147 @@ def build_initial_blueprint(
                 "detected_detail_level": "minimal",
             },
         },
-        "responsibilities": responsibilities,
+        "authority": {
+            "layout": "sharded",
+            "shard_strategy": "domain",
+            "default_shard": DEFAULT_CORE_SHARD,
+            "allow_empty_shards": False,
+            "auto_create_shards": True,
+            "auto_move_blocks_on_save": True,
+            "remove_empty_shards": False,
+        },
+        "includes": [DEFAULT_CORE_SHARD],
     }
-    
+
     return blueprint_data
 
 
-def write_blueprint(blueprint_path: Path, blueprint_data: Dict[str, Any]) -> None:
-    """Write blueprint data to YAML file.
+def _derive_initial_domain(unit: DiscoveredCodeUnit) -> str:
+    """Derive a simple initial domain from a discovered code unit path."""
+
+    path_parts = Path(unit.path).parts
+    if len(path_parts) >= 3 and path_parts[0] in {"src", "app"}:
+        return Path(str(path_parts[2])).stem
+    if len(path_parts) >= 2 and path_parts[0] in {"src", "app"}:
+        return Path(str(path_parts[1])).stem
+    if len(path_parts) >= 2:
+        return str(path_parts[-2])
+    return "core"
+
+
+def _derive_initial_purpose(unit: DiscoveredCodeUnit) -> str:
+    """Derive a deterministic initial purpose for one discovered code unit."""
+
+    normalized_symbol = unit.symbol.replace(".", " ").replace("_", " ").strip()
+    sanitized_symbol = " ".join(
+        "sensitive" if word.lower() in {"secret", "token", "password", "credential", "credentials"} else word
+        for word in normalized_symbol.split()
+    )
+    return f"maintain {sanitized_symbol} authority behavior"
+
+
+def build_core_shard(discovered_units: List[DiscoveredCodeUnit]) -> Dict[str, Any]:
+    """Build core shard data from discovered units.
     
     Args:
-        blueprint_path: Path to the blueprint file.
-        blueprint_data: Blueprint data to write.
+        discovered_units: List of discovered code units.
+    
+    Returns:
+        Dictionary containing shard data with blocks.
+    """
+    blocks = []
+    seen_block_ids: dict[str, int] = {}
+    for unit in discovered_units:
+        normalized_symbol_type = normalize_symbol_type(unit.symbol_type)
+        base_block_id = to_snake_case(f"{unit.module}_{unit.symbol}")
+        next_sequence = seen_block_ids.get(base_block_id, 0)
+        seen_block_ids[base_block_id] = next_sequence + 1
+        block_id = base_block_id if next_sequence == 0 else f"{base_block_id}_{next_sequence + 1}"
+
+        block = BlockFactory.create(
+            block_id=block_id,
+            name=unit.symbol,
+            purpose=_derive_initial_purpose(unit),
+            domain=_derive_initial_domain(unit),
+            status="active",
+            code={
+                "path": unit.path,
+                "module": unit.module,
+                "symbol": unit.symbol,
+                "kind": normalized_symbol_type,
+                "start_line": unit.start_line,
+                "end_line": unit.end_line,
+            },
+            detected={
+                "qualified_name": unit.qualified_name,
+                "kind": normalized_symbol_type,
+                "methods": unit.methods,
+                "functions": unit.functions,
+            },
+        )
+
+        blocks.append(block)
+    
+    shard_data = {"blocks": blocks}
+    return shard_data
+
+
+def _write_shard(shard_path: Path, shard_data: Dict[str, Any], project_root: Path) -> None:
+    """Write a shard file to disk.
+    
+    Args:
+        shard_path: Path to the shard file.
+        shard_data: Shard data to write.
+        project_root: Project root for lock management.
+    """
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError("PyYAML is required but not installed")
+    
+    lock_state = get_authority_protection_status(project_root=project_root).status
+    requires_temporary_unlock = lock_state in {"locked", "degraded"}
+    temporarily_unlocked = False
+
+    ensure_blueprint_can_be_written(project_root=project_root)
+
+    if requires_temporary_unlock and has_temporary_blueprint_unlock_authorization():
+        unlock_result = unlock_authority(project_root=project_root)
+        if unlock_result.status != "unlocked":
+            raise BlueprintLockedError(
+                "Blueprint is locked and temporary unlock failed. Run bpfw unlock before editing authority data."
+            )
+        temporarily_unlocked = True
+
+    shard_path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = yaml.safe_dump(shard_data, sort_keys=False, allow_unicode=True)
+    try:
+        shard_path.write_text(rendered, encoding="utf-8")
+    except PermissionError as error:
+        raise BlueprintLockedError(
+            "Blueprint shard write failed due to OS-level permission protection."
+        ) from error
+    finally:
+        if temporarily_unlocked:
+            relock_result = lock_authority(project_root=project_root)
+            if relock_result.status not in {"locked", "degraded"}:
+                raise BlueprintLockedError(
+                    "Blueprint shard was written, but automatic re-lock failed. "
+                    f"Current lock status: {relock_result.status}."
+                )
+
+
+def write_blueprint(
+    blueprint_path: Path,
+    blueprint_data: Dict[str, Any],
+    shard_data: Dict[str, Any] | None = None,
+) -> None:
+    """Write blueprint index and optionally shard data to YAML files.
+    
+    Args:
+        blueprint_path: Path to the blueprint index file.
+        blueprint_data: Blueprint index data to write.
+        shard_data: Optional shard data to write to default core shard.
     """
     try:
         import yaml
@@ -135,20 +265,83 @@ def write_blueprint(blueprint_path: Path, blueprint_data: Dict[str, Any]) -> Non
         raise ImportError("PyYAML is required but not installed")
     
     project_root = blueprint_path.parent.parent
+    
+    # Write shard if provided
+    if shard_data:
+        core_shard_path = resolve_shard_path(project_root, "core.yaml")
+        _write_shard(core_shard_path, shard_data, project_root)
+    
+    lock_state = get_authority_protection_status(project_root=project_root).status
+    requires_temporary_unlock = lock_state in {"locked", "degraded"}
+    temporarily_unlocked = False
+
     ensure_blueprint_can_be_written(project_root=project_root)
+
+    if requires_temporary_unlock and has_temporary_blueprint_unlock_authorization():
+        unlock_result = unlock_authority(project_root=project_root)
+        if unlock_result.status != "unlocked":
+            raise BlueprintLockedError(
+                "Blueprint is locked and temporary unlock failed. Run bpfw unlock before editing authority data."
+            )
+        temporarily_unlocked = True
+
     blueprint_path.parent.mkdir(parents=True, exist_ok=True)
     rendered = yaml.safe_dump(blueprint_data, sort_keys=False, allow_unicode=True)
-    blueprint_path.write_text(rendered, encoding="utf-8")
+    try:
+        blueprint_path.write_text(rendered, encoding="utf-8")
+    except PermissionError as error:
+        raise BlueprintLockedError(
+            "Blueprint write failed due to OS-level permission protection."
+        ) from error
+    finally:
+        if temporarily_unlocked:
+            relock_result = lock_authority(project_root=project_root)
+            if relock_result.status not in {"locked", "degraded"}:
+                raise BlueprintLockedError(
+                    "Blueprint was written, but automatic re-lock failed. "
+                    f"Current lock status: {relock_result.status}."
+                )
 
 
 BLUEPRINT_RELATIVE_PATH = "bpfw/blueprint.yaml"
 
 
-def run_init(project_root: Path) -> tuple[bool, str, int]:
+def _extract_fix_command(reason: str) -> str | None:
+    """Extract ownership fix command from protection setup reason text."""
+
+    marker = "Fix with: "
+    if marker not in reason:
+        return None
+    command = reason.split(marker, maxsplit=1)[1].strip()
+    return command or None
+
+
+def _try_interactive_permission_fix(setup_result) -> bool:  # noqa: ANN001
+    """Run ownership fix as an interactive fallback when available."""
+
+    if not sys.stdin.isatty():
+        return False
+    if setup_result.support is None:
+        return False
+
+    fix_command = _extract_fix_command(reason=setup_result.support.reason)
+    if fix_command is None:
+        return False
+
+    print("BPFW needs elevated permissions to fix project ownership before lock setup.")
+    print("This will run:")
+    print(f"  {fix_command}")
+
+    command_result = subprocess.run(fix_command, shell=True, check=False)
+    return command_result.returncode == 0
+
+
+def run_init(project_root: Path, allow_unprotected: bool = False) -> tuple[bool, str, int]:
     """Run the init command to create initial blueprint.
     
     Args:
         project_root: Root directory of the project.
+        allow_unprotected: Whether init may succeed without OS authority protection.
     
     Returns:
         Tuple of (success, message, exit_code).
@@ -159,7 +352,14 @@ def run_init(project_root: Path) -> tuple[bool, str, int]:
     
     # Step 3: If blueprint already exists, do not overwrite
     if blueprint_path.exists():
-        setup_result = run_protection_setup(project_root=project_root)
+        setup_result = run_protection_setup(project_root=project_root, allow_unprotected=allow_unprotected)
+        if (
+            not allow_unprotected
+            and not setup_result.allowed
+            and setup_result.lock_state == "unsupported"
+            and _try_interactive_permission_fix(setup_result=setup_result)
+        ):
+            setup_result = run_protection_setup(project_root=project_root, allow_unprotected=allow_unprotected)
         message = format_init_setup_summary(result=setup_result)
         return setup_result.allowed, message, 0 if setup_result.allowed else 1
     
@@ -193,7 +393,7 @@ def run_init(project_root: Path) -> tuple[bool, str, int]:
         ignored_paths=ignored_paths,
     )
     
-    # Step 8: Create blueprint YAML
+    # Step 8: Create blueprint index YAML
     blueprint_data = build_initial_blueprint(
         project_root=project_root,
         source_roots=source_roots,
@@ -201,21 +401,36 @@ def run_init(project_root: Path) -> tuple[bool, str, int]:
         discovered_units=scan_result.discovered_units,
     )
     
-    # Step 9: Write bpfw/blueprint.yaml
-    write_blueprint(blueprint_path=blueprint_path, blueprint_data=blueprint_data)
-
-    setup_result = run_protection_setup(project_root=project_root)
+    # Step 9: Create core shard YAML
+    shard_data = build_core_shard(discovered_units=scan_result.discovered_units)
     
-    # Step 10: Print init summary
+    # Step 10: Write blueprint index and core shard
+    write_blueprint(
+        blueprint_path=blueprint_path,
+        blueprint_data=blueprint_data,
+        shard_data=shard_data,
+    )
+
+    setup_result = run_protection_setup(project_root=project_root, allow_unprotected=allow_unprotected)
+    if (
+        not allow_unprotected
+        and not setup_result.allowed
+        and setup_result.lock_state == "unsupported"
+        and _try_interactive_permission_fix(setup_result=setup_result)
+    ):
+        setup_result = run_protection_setup(project_root=project_root, allow_unprotected=allow_unprotected)
+    
+    # Step 11: Print init summary
     total_units = len(scan_result.discovered_units)
-    pending_intent = sum(1 for _ in scan_result.discovered_units)
-    pending_lifecycle = sum(1 for _ in scan_result.discovered_units)
-    pending_domain = sum(1 for _ in scan_result.discovered_units)
+    pending_purpose = 0
+    pending_lifecycle = 0
+    pending_domain = 0
     
     init_summary = f"""BPFW initialized.
 
 Blueprint:
   created: {BLUEPRINT_RELATIVE_PATH}
+  shards: {DEFAULT_CORE_SHARD}
 
 Project:
   language: python
@@ -224,12 +439,12 @@ Detected code units:
   total: {total_units}
 
 Pending fields:
-  intent: {pending_intent}
-  lifecycle: {pending_lifecycle}
+  purpose: {pending_purpose}
+  status: {pending_lifecycle}
   domain: {pending_domain}
 
 Next:
-  bpfw inspect"""
+  Fill authority shards, then run bpfw verify"""
     
     message = f"{init_summary}\n\n{format_init_setup_summary(result=setup_result)}"
     return setup_result.allowed, message, 0 if setup_result.allowed else 1

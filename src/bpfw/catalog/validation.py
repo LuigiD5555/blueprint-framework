@@ -1,8 +1,8 @@
-"""Structural and lifecycle validation for BPFW blueprint authority."""
+"""Structural and status validation for BPFW blueprint authority."""
 
 from typing import Any, Dict, List
 
-from bpfw.catalog.lifecycle import ALLOWED_LIFECYCLES, is_allowed_lifecycle
+from bpfw.catalog.status import ALLOWED_STATUSES, is_allowed_status
 from bpfw.catalog.models import (
     AUTHORITY_STATE_EMPTY,
     AUTHORITY_STATE_INVALID,
@@ -12,8 +12,8 @@ from bpfw.reports.finding import FINDING_SEVERITY_BLOCK, Finding
 
 _SOURCE = "bpfw"
 
-_RESPONSIBILITY_REQUIRED_FIELDS = ("id", "intent", "canonical_name", "domain", "lifecycle")
-_LOCATION_REQUIRED_FIELDS = ("path", "symbol", "symbol_type")
+_BLOCK_REQUIRED_FIELDS = ("id", "purpose", "name", "domain", "status")
+_CODE_REQUIRED_FIELDS = ("path", "symbol", "kind")
 
 
 def _is_blank(value: Any) -> bool:
@@ -21,186 +21,224 @@ def _is_blank(value: Any) -> bool:
     return value is None or value == ""
 
 
-def _safe_location_field(responsibility: Dict[str, Any], field_name: str) -> Any:
-    """Safely retrieve a field from the location sub-dict."""
-    location = responsibility.get("location")
-    if isinstance(location, dict):
-        return location.get(field_name)
-    return None
+def _safe_code_field(block: Dict[str, Any], field_name: str) -> Any:
+    """Safely retrieve a field from canonical code metadata."""
+    code = block.get("code", {})
+    if not isinstance(code, dict):
+        code = {}
+    if field_name == "kind":
+        return code.get("kind")
+    return code.get(field_name)
 
 
-def _validate_responsibility_fields(
-    responsibility: Any,
-    responsibility_index: int,
-    findings: List[Finding],
-) -> None:
-    """Validate that all required catalog fields are present and non-blank."""
-    if not isinstance(responsibility, dict):
-        findings.append(
-            Finding(
-                source=_SOURCE,
-                code="INCOMPLETE_RESPONSIBILITY",
-                severity=FINDING_SEVERITY_BLOCK,
-                message="A declared responsibility is missing required authority fields.",
-                evidence={
-                    "responsibility_index": responsibility_index,
-                    "missing_fields": list(
-                        _RESPONSIBILITY_REQUIRED_FIELDS + _LOCATION_REQUIRED_FIELDS
+# ---------------------------------------------------------------------------
+# Validation strategy protocol and concrete rules
+# ---------------------------------------------------------------------------
+
+class ValidationRule:
+    """Base class for composable validation rules."""
+
+    def validate(self, blocks: List[Any], findings: List[Finding]) -> None:
+        """Run this rule against *blocks*, appending any findings."""
+
+
+class PerBlockValidationRule(ValidationRule):
+    """Rule applied to each block individually."""
+
+    def validate_block(self, block: Any, block_index: int, findings: List[Finding]) -> None:
+        """Validate a single block."""
+
+    def validate(self, blocks: List[Any], findings: List[Finding]) -> None:
+        for block_index, block in enumerate(blocks):
+            self.validate_block(block, block_index, findings)
+
+
+class CrossBlockValidationRule(ValidationRule):
+    """Rule applied across all blocks at once."""
+    pass
+
+
+class BlockFieldsRule(PerBlockValidationRule):
+    """Validate that all required block fields are present and non-blank."""
+
+    def validate_block(self, block: Any, block_index: int, findings: List[Finding]) -> None:
+        if not isinstance(block, dict):
+            findings.append(
+                Finding(
+                    source=_SOURCE,
+                    code="INCOMPLETE_BLOCK",
+                    severity=FINDING_SEVERITY_BLOCK,
+                    message=(
+                        "Blueprint authority drift: a declared block in "
+                        "bpfw/blueprint.yaml is incomplete and cannot be enforced."
                     ),
-                },
+                    evidence={
+                        "block_index": block_index,
+                        "missing_fields": list(_BLOCK_REQUIRED_FIELDS + _CODE_REQUIRED_FIELDS),
+                    },
+                )
             )
-        )
-        return
+            return
 
-    missing_fields: List[str] = []
+        missing_fields: List[str] = []
 
-    for field_name in _RESPONSIBILITY_REQUIRED_FIELDS:
-        if _is_blank(responsibility.get(field_name)):
-            missing_fields.append(field_name)
+        for field_name in ("id", "name", "domain"):
+            if _is_blank(block.get(field_name)):
+                missing_fields.append(field_name)
 
-    for field_name in _LOCATION_REQUIRED_FIELDS:
-        if _is_blank(_safe_location_field(responsibility, field_name)):
-            missing_fields.append(f"location.{field_name}")
+        if _is_blank(block.get("purpose")):
+            missing_fields.append("purpose")
+        if _is_blank(block.get("status")):
+            missing_fields.append("status")
 
-    if missing_fields:
-        findings.append(
-            Finding(
-                source=_SOURCE,
-                code="INCOMPLETE_RESPONSIBILITY",
-                severity=FINDING_SEVERITY_BLOCK,
-                path=_safe_location_field(responsibility, "path"),
-                symbol=_safe_location_field(responsibility, "symbol"),
-                message="A declared responsibility is missing required authority fields.",
-                evidence={
-                    "responsibility_index": responsibility_index,
-                    "missing_fields": missing_fields,
-                },
-            )
-        )
+        for field_name in _CODE_REQUIRED_FIELDS:
+            if _is_blank(_safe_code_field(block, field_name)):
+                missing_fields.append(f"code.{field_name}")
 
-
-def _validate_responsibility_lifecycle(
-    responsibility: Any,
-    findings: List[Finding],
-) -> None:
-    """Validate that the responsibility lifecycle is allowed in the MVP."""
-    if not isinstance(responsibility, dict):
-        return
-
-    lifecycle = responsibility.get("lifecycle")
-    if lifecycle is not None and not is_allowed_lifecycle(lifecycle):
-        findings.append(
-            Finding(
-                source=_SOURCE,
-                code="INVALID_LIFECYCLE",
-                severity=FINDING_SEVERITY_BLOCK,
-                path=_safe_location_field(responsibility, "path"),
-                symbol=_safe_location_field(responsibility, "symbol"),
-                message="The responsibility lifecycle is not allowed in the MVP.",
-                evidence={
-                    "lifecycle": lifecycle,
-                    "allowed_lifecycles": list(ALLOWED_LIFECYCLES),
-                },
-            )
-        )
-
-
-def _validate_duplicate_ids(
-    responsibilities: List[Any],
-    findings: List[Finding],
-) -> None:
-    """Detect responsibility entries that share the same id."""
-    id_indexes: Dict[str, List[int]] = {}
-    for index, responsibility in enumerate(responsibilities):
-        if not isinstance(responsibility, dict):
-            continue
-        responsibility_id = responsibility.get("id")
-        if not isinstance(responsibility_id, str) or responsibility_id == "":
-            continue
-        if responsibility_id not in id_indexes:
-            id_indexes[responsibility_id] = []
-        id_indexes[responsibility_id].append(index)
-
-    for responsibility_id, indexes in id_indexes.items():
-        if len(indexes) > 1:
+        if missing_fields:
             findings.append(
                 Finding(
                     source=_SOURCE,
-                    code="DUPLICATE_RESPONSIBILITY_ID",
+                    code="INCOMPLETE_BLOCK",
                     severity=FINDING_SEVERITY_BLOCK,
-                    message="More than one responsibility uses the same id.",
+                    path=_safe_code_field(block, "path"),
+                    symbol=_safe_code_field(block, "symbol"),
+                    message=(
+                        "Blueprint authority drift: declared block metadata is incomplete "
+                        "in bpfw/blueprint.yaml."
+                    ),
                     evidence={
-                        "id": responsibility_id,
-                        "indexes": indexes,
+                        "block_index": block_index,
+                        "missing_fields": missing_fields,
                     },
                 )
             )
 
 
-def _validate_duplicate_active_intent(
-    responsibilities: List[Any],
-    findings: List[Finding],
-) -> None:
-    """Detect intents that have more than one active responsibility."""
-    intent_active_ids: Dict[str, List[str]] = {}
-    for responsibility in responsibilities:
-        if not isinstance(responsibility, dict):
-            continue
-        lifecycle = responsibility.get("lifecycle")
-        if lifecycle != "active":
-            continue
-        intent = responsibility.get("intent")
-        responsibility_id = responsibility.get("id")
-        if not isinstance(intent, str) or intent == "":
-            continue
-        if not isinstance(responsibility_id, str) or responsibility_id == "":
-            continue
-        if intent not in intent_active_ids:
-            intent_active_ids[intent] = []
-        intent_active_ids[intent].append(responsibility_id)
+class BlockStatusRule(PerBlockValidationRule):
+    """Validate that the block status is allowed in the MVP."""
 
-    for intent, active_ids in intent_active_ids.items():
-        if len(active_ids) > 1:
+    def validate_block(self, block: Any, block_index: int, findings: List[Finding]) -> None:
+        if not isinstance(block, dict):
+            return
+
+        status = block.get("status")
+        if status is not None and not is_allowed_status(status):
             findings.append(
                 Finding(
                     source=_SOURCE,
-                    code="DUPLICATE_ACTIVE_INTENT",
+                    code="INVALID_STATUS",
                     severity=FINDING_SEVERITY_BLOCK,
-                    message="Only one responsibility can be active for the same intent.",
+                    path=_safe_code_field(block, "path"),
+                    symbol=_safe_code_field(block, "symbol"),
+                    message="The block status is not allowed in the MVP.",
                     evidence={
-                        "intent": intent,
-                        "active_responsibility_ids": active_ids,
+                        "status": status,
+                        "allowed_statuses": list(ALLOWED_STATUSES),
                     },
                 )
             )
+
+
+class DuplicateIdsRule(CrossBlockValidationRule):
+    """Detect block entries that share the same id."""
+
+    def validate(self, blocks: List[Any], findings: List[Finding]) -> None:
+        id_indexes: Dict[str, List[int]] = {}
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+            block_id = block.get("id")
+            if not isinstance(block_id, str) or block_id == "":
+                continue
+            if block_id not in id_indexes:
+                id_indexes[block_id] = []
+            id_indexes[block_id].append(index)
+
+        for block_id, indexes in id_indexes.items():
+            if len(indexes) > 1:
+                findings.append(
+                    Finding(
+                        source=_SOURCE,
+                        code="DUPLICATE_BLOCK_ID",
+                        severity=FINDING_SEVERITY_BLOCK,
+                        message="More than one block uses the same id.",
+                        evidence={
+                            "id": block_id,
+                            "indexes": indexes,
+                        },
+                    )
+                )
+
+
+class DuplicateActivePurposeRule(CrossBlockValidationRule):
+    """Detect purposes that have more than one active block."""
+
+    def validate(self, blocks: List[Any], findings: List[Finding]) -> None:
+        purpose_active_ids: Dict[str, List[str]] = {}
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            status = block.get("status")
+            if status != "active":
+                continue
+            purpose = block.get("purpose")
+            block_id = block.get("id")
+            if not isinstance(purpose, str) or purpose == "":
+                continue
+            if not isinstance(block_id, str) or block_id == "":
+                continue
+            if purpose not in purpose_active_ids:
+                purpose_active_ids[purpose] = []
+            purpose_active_ids[purpose].append(block_id)
+
+        for purpose, active_ids in purpose_active_ids.items():
+            if len(active_ids) > 1:
+                findings.append(
+                    Finding(
+                        source=_SOURCE,
+                        code="DUPLICATE_ACTIVE_PURPOSE",
+                        severity=FINDING_SEVERITY_BLOCK,
+                        message="Only one block can be active for the same purpose.",
+                        evidence={
+                            "purpose": purpose,
+                            "active_block_ids": active_ids,
+                        },
+                    )
+                )
+
+
+class BlueprintValidator:
+    """Composable validation pipeline that runs ordered rules."""
+
+    def __init__(self, rules: List[ValidationRule] | None = None) -> None:
+        self.rules: List[ValidationRule] = rules or [
+            BlockFieldsRule(),
+            BlockStatusRule(),
+            DuplicateIdsRule(),
+            DuplicateActivePurposeRule(),
+        ]
+
+    def validate(self, blocks: List[Any]) -> List[Finding]:
+        """Run all rules and return accumulated findings."""
+        findings: List[Finding] = []
+        for rule in self.rules:
+            rule.validate(blocks, findings)
+        return findings
+
+
+# Default validator instance for public API
+_default_validator = BlueprintValidator()
 
 
 def validate_blueprint_structure(
     blueprint_data: Dict[str, Any],
     authority_state: str,
 ) -> List[Finding]:
-    """Validate the structural integrity and lifecycle rules of a blueprint.
-
-    Parameters
-    ----------
-    blueprint_data:
-        Parsed YAML content of the blueprint file.
-    authority_state:
-        One of the ``AUTHORITY_STATE_*`` constants from
-        :mod:`bpfw.catalog.models`.
-
-    Returns
-    -------
-    list[Finding]
-        Normalized findings.  Returns an empty list for non-actionable
-        catalog states (``missing``, ``empty``).
-    """
-
-    # Non-actionable states – nothing to validate.
+    """Validate the structural integrity and status rules of a blueprint."""
     if authority_state in (AUTHORITY_STATE_MISSING, AUTHORITY_STATE_EMPTY):
         return []
 
-    # Invalid catalog file: the file could not be parsed as valid YAML.
     if authority_state == AUTHORITY_STATE_INVALID:
         return [
             Finding(
@@ -211,9 +249,8 @@ def validate_blueprint_structure(
             )
         ]
 
-    # The responsibilities key must be a list.
-    responsibilities = blueprint_data.get("responsibilities")
-    if not isinstance(responsibilities, list):
+    blocks = blueprint_data.get("blocks", [])
+    if not isinstance(blocks, list):
         return [
             Finding(
                 source=_SOURCE,
@@ -223,17 +260,4 @@ def validate_blueprint_structure(
             )
         ]
 
-    findings: List[Finding] = []
-
-    # Per-responsibility structural and lifecycle checks.
-    for responsibility_index, responsibility in enumerate(responsibilities):
-        _validate_responsibility_fields(
-            responsibility, responsibility_index, findings
-        )
-        _validate_responsibility_lifecycle(responsibility, findings)
-
-    # Cross-responsibility duplicate checks.
-    _validate_duplicate_ids(responsibilities, findings)
-    _validate_duplicate_active_intent(responsibilities, findings)
-
-    return findings
+    return _default_validator.validate(blocks)
