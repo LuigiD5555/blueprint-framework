@@ -1,90 +1,196 @@
 import pytest
+from pathlib import Path
+import sys
 
-from bpfw.cli import MVP_COMMANDS, build_parser, normalize_command
+from bpfw.catalog.access_control import authorize_blueprint_writes_for_tool, authorize_temporary_blueprint_unlock_for_tool
+from bpfw.cli import (
+    MVP_COMMANDS,
+    main,
+    resolve_cli_command,
+    _migrate_root_blocks_to_default_shard,
+    _attempt_permission_fix,
+)
 
 
-def test_public_command_surface_is_mvp_only() -> None:
+def test_public_command_surface_is_core_only() -> None:
     assert MVP_COMMANDS == (
         "init",
-        "inspect",
-        "editor",
         "verify",
         "status",
         "lock",
         "unlock",
-        "repair",
+        "watch",
+        "reshard",
     )
 
 
 def test_lock_maps_without_subcommands() -> None:
-    assert normalize_command("lock", None) == "lock"
+    assert resolve_cli_command("lock", None) == "lock"
 
 
 def test_unlock_maps_default_and_blueprint_target() -> None:
-    assert normalize_command("unlock", None) == "unlock"
-    assert normalize_command("unlock", "blueprint") == "unlock"
-
-
-def test_repair_maps_without_subcommands() -> None:
-    assert normalize_command("repair", None) == "repair"
-
-
-def test_integration_commands_map_without_subcommands() -> None:
-    assert normalize_command("inspect", None) == "inspect"
-    assert normalize_command("editor", None) == "editor"
+    assert resolve_cli_command("unlock", None) == "unlock"
+    assert resolve_cli_command("unlock", "blueprint") == "unlock"
 
 
 def test_catalog_commands_reject_subcommands() -> None:
-    for command in ("init", "inspect", "editor", "verify", "status"):
+    for command in ("init", "watch", "status", "reshard", "lock"):
         with pytest.raises(ValueError):
-            normalize_command(command, "extra")
+            resolve_cli_command(command, "extra")
+
+
+def test_verify_accepts_supported_filters() -> None:
+    assert resolve_cli_command("verify", "undeclared") == "verify"
+    assert resolve_cli_command("verify", "missing") == "verify"
+    assert resolve_cli_command("verify", "duplicate") == "verify"
+    assert resolve_cli_command("verify", "secret") == "verify"
+    assert resolve_cli_command("verify", "invalid") == "verify"
+    assert resolve_cli_command("verify", "all") == "verify"
+
+
+def test_verify_rejects_unknown_filter() -> None:
+    with pytest.raises(ValueError, match="unknown verify filter"):
+        resolve_cli_command("verify", "extra")
 
 
 def test_unlock_rejects_non_blueprint_target() -> None:
     with pytest.raises(ValueError, match="unlock only supports blueprint resource"):
-        normalize_command("unlock", "other")
+        resolve_cli_command("unlock", "other")
 
 
-def test_repair_rejects_subcommands() -> None:
-    with pytest.raises(ValueError, match="repair does not accept subcommands"):
-        normalize_command("repair", "extra")
+def test_unknown_command_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unknown command"):
+        resolve_cli_command("unknown", None)
 
 
-def test_external_plugin_command_maps_without_subcommands() -> None:
-    assert normalize_command("external", None) == "external"
+def test_resolve_cli_command_is_case_and_whitespace_insensitive() -> None:
+    assert resolve_cli_command("  VERIFY  ", None) == "verify"
+    assert resolve_cli_command("  WATCH  ", None) == "watch"
+    assert resolve_cli_command(" unlock ", "  BLUEPRINT  ") == "unlock"
 
 
-def test_external_plugin_command_rejects_subcommands() -> None:
-    with pytest.raises(ValueError, match="external does not accept subcommands"):
-        normalize_command("external", "extra")
+def test_main_help_uses_curated_bpfw_format() -> None:
+    from bpfw.cli import MAIN_HELP_TEXT, build_parser
+
+    assert build_parser().format_help() == f"{MAIN_HELP_TEXT}\n"
 
 
-def test_parser_accepts_external_plugin_command() -> None:
-    parser = build_parser()
+def test_main_help_hides_internal_options() -> None:
+    from bpfw.cli import build_parser
 
-    parsed_arguments = parser.parse_args(["external"])
+    rendered_help = build_parser().format_help()
 
-    assert parsed_arguments.command == "external"
+    assert "--ttl" not in rendered_help
+    assert "--accept-scan" not in rendered_help
+    assert "--force-new" not in rendered_help
+    assert "-a, --all" not in rendered_help
+    assert "bpfw verify --all" in rendered_help
 
 
-def test_parser_help_explains_public_commands(capsys) -> None:
-    parser = build_parser()
+def test_migrate_root_blocks_to_default_shard_moves_legacy_blocks(tmp_path: Path) -> None:
+    import yaml
 
-    with pytest.raises(SystemExit) as exit_info:
-        parser.parse_args(["-h"])
+    (tmp_path / "bpfw" / "blocks").mkdir(parents=True)
+    blueprint_path = tmp_path / "bpfw" / "blueprint.yaml"
+    core_shard_path = tmp_path / "bpfw" / "blocks" / "core.yaml"
 
-    output = capsys.readouterr().out
-    assert exit_info.value.code == 0
-    assert "Commands:" in output
-    assert "inspect    Review detected code and declare responsibilities." in output
-    assert "plan" not in output
-    assert "editor     Navigate and edit the existing blueprint." in output
-    assert "repair     Repair local authority protection." in output
-    assert "Extensions:" not in output
-    assert "Plugin commands:" not in output
-    assert "bpfw.integrations" not in output
-    assert "--project-root" in output
-    assert "--json" in output
-    assert "--ttl" not in output
-    assert "--accept-scan" not in output
-    assert "--force-new" not in output
+    blueprint_data = {
+        "version": 1,
+        "project": {"id": "demo", "name": "demo"},
+        "authority": {"layout": "sharded", "default_shard": "bpfw/blocks/core.yaml"},
+        "includes": ["bpfw/blocks/core.yaml"],
+        "blocks": [{"id": "legacy_1"}, {"id": "legacy_2"}],
+    }
+    core_data = {"blocks": [{"id": "legacy_2"}, {"id": "existing_1"}]}
+
+    blueprint_path.write_text(yaml.safe_dump(blueprint_data, sort_keys=False), encoding="utf-8")
+    core_shard_path.write_text(yaml.safe_dump(core_data, sort_keys=False), encoding="utf-8")
+
+    with authorize_blueprint_writes_for_tool("reshard"):
+        with authorize_temporary_blueprint_unlock_for_tool("reshard"):
+            summary = _migrate_root_blocks_to_default_shard(project_root=tmp_path)
+    migrated_blueprint = yaml.safe_load(blueprint_path.read_text(encoding="utf-8"))
+    migrated_core = yaml.safe_load(core_shard_path.read_text(encoding="utf-8"))
+
+    assert summary["migrated"] == 1
+    assert summary["skipped"] == 1
+    assert "blocks" not in migrated_blueprint
+    assert migrated_blueprint["includes"] == ["bpfw/blocks/core.yaml"]
+    assert {block["id"] for block in migrated_core["blocks"]} == {"legacy_1", "legacy_2", "existing_1"}
+
+
+def test_attempt_permission_fix_executes_sudo_sequence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "bpfw" / "blocks").mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    class _Completed:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def fake_run(command: list[str], cwd: Path, check: bool):  # noqa: ANN001
+        calls.append(command)
+        return _Completed(0)
+
+    monkeypatch.setattr("bpfw.cli.subprocess.run", fake_run)
+    error = PermissionError(13, "Permission denied", str(tmp_path / "bpfw" / "blueprint.yaml"))
+
+    assert _attempt_permission_fix(project_root=tmp_path, error=error) is True
+    assert calls[0] == ["sudo", "-v"]
+    assert calls[1][0:2] == ["sudo", "chown"]
+    assert calls[2][0:2] == ["sudo", "chmod"]
+
+
+def test_migrate_root_blocks_to_default_shard_skips_duplicate_code_declarations(tmp_path: Path) -> None:
+    import yaml
+
+    (tmp_path / "bpfw" / "blocks").mkdir(parents=True)
+    blueprint_path = tmp_path / "bpfw" / "blueprint.yaml"
+    core_shard_path = tmp_path / "bpfw" / "blocks" / "core.yaml"
+
+    blueprint_data = {
+        "version": 1,
+        "project": {"id": "demo", "name": "demo"},
+        "authority": {"layout": "sharded", "default_shard": "bpfw/blocks/core.yaml"},
+        "includes": ["bpfw/blocks/core.yaml"],
+        "blocks": [
+            {
+                "id": "legacy_duplicate",
+                "code": {
+                    "path": "src/bpfw/authority/document.py",
+                    "symbol": "AuthorityDocument.get_blocks",
+                    "kind": "method",
+                },
+            }
+        ],
+    }
+    core_data = {
+        "blocks": [
+            {
+                "id": "existing_reference",
+                "code": {
+                    "path": "src/bpfw/authority/document.py",
+                    "symbol": "AuthorityDocument.get_blocks",
+                    "kind": "method",
+                },
+            }
+        ]
+    }
+
+    blueprint_path.write_text(yaml.safe_dump(blueprint_data, sort_keys=False), encoding="utf-8")
+    core_shard_path.write_text(yaml.safe_dump(core_data, sort_keys=False), encoding="utf-8")
+
+    with authorize_blueprint_writes_for_tool("reshard"):
+        with authorize_temporary_blueprint_unlock_for_tool("reshard"):
+            summary = _migrate_root_blocks_to_default_shard(project_root=tmp_path)
+    migrated_core = yaml.safe_load(core_shard_path.read_text(encoding="utf-8"))
+
+    assert summary["migrated"] == 0
+    assert summary["skipped"] == 1
+    assert len(migrated_core["blocks"]) == 1
+
+
+def test_removed_public_commands_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["bpfw", "run"])
+
+    with pytest.raises(SystemExit):
+        main()
