@@ -8,7 +8,7 @@
 ## Fuente de contrato
 
 La especificación de API del productor se mantiene en el repositorio BPFW experimental:
-[READ_API_FOR_AGENTS_V1.md](https://github.com/LuigiD5555/bpfw-experimental/blob/docs/bpfw-read-api-integration-20261119/docs/integrations/READ_API_FOR_AGENTS_V1.md).
+[READ_API_FOR_AGENTS_V1.md](https://github.com/LuigiD5555/bpfw-experimental/pull/7).
 No copiar el plan completo al Core ni asumir que la versión experimental es la distribución Core actual.
 
 ## Estado y frontera del Core
